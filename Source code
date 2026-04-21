@@ -1,0 +1,1340 @@
+#include <WiFi.h>
+#include <time.h>
+#include <Preferences.h>
+#include <Wire.h>
+#include <MFRC522_I2C.h>
+#include <Adafruit_Fingerprint.h>
+#include <TFT_eSPI.h>
+#include <SPI.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <esp_system.h>
+
+// ==================== CONFIGURATION ====================
+const char* ssid               = "YOUR_SSID";
+const char* password           = "YOUR_WIFI_POSSWORD";
+const char* ntpServer          = "pool.ntp.org";
+const long  gmtOffset_sec      = 19800;
+const int   daylightOffset_sec = 0;
+const char* serverUrl          = "YOUR_SERVER_LINK";
+
+// ==================== PIN DEFINITIONS ====================
+#define I2C_SDA      32
+#define I2C_SCL      33
+#define RFID_ADDRESS 0x28
+#define RFID_RST_PIN 255
+#define FP_RX        16
+#define FP_TX        17
+#define BUZZER_PIN   26
+#define TFT_BL       -1
+
+// ==================== DISPLAY ====================
+#define SCREEN_W  320
+#define SCREEN_H  240
+#define TOP_BAR_H  36
+#define BOT_BAR_H  38
+#define MID_Y      TOP_BAR_H
+#define MID_H      (SCREEN_H - TOP_BAR_H - BOT_BAR_H)
+
+// ==================== COLOURS ====================
+#define CLR_TOP_BG       0x1082
+#define CLR_MID_BG       0x000F
+#define CLR_BOT_BG       TFT_RED
+#define CLR_CLOCK        TFT_YELLOW
+#define CLR_DATE_BG      TFT_BLACK
+#define CLR_TOP_TXT      TFT_WHITE
+#define CLR_BOT_TXT      TFT_BLACK
+#define CLR_WELCOME_BG   0x0720
+#define CLR_WELCOME_ACC  TFT_WHITE
+#define CLR_THANKYOU_BG  0x000F
+#define CLR_THANKYOU_ACC TFT_CYAN
+
+// ==================== BEEP PATTERNS ====================
+#define BEEP_BOOT         20
+#define BEEP_SCAN         30
+#define BEEP_WELCOME      60
+#define BEEP_THANKYOU_1   35
+#define BEEP_THANKYOU_2   35
+#define BEEP_THANKYOU_GAP 60
+#define BEEP_ENROLL_OK   120
+#define BEEP_ERROR        80
+
+// ==================== OBJECTS ====================
+Preferences    preferences;
+String         deviceID;
+TFT_eSPI       tft = TFT_eSPI();
+MFRC522_I2C    rfid(RFID_ADDRESS, RFID_RST_PIN, &Wire);
+HardwareSerial fpSerial(2);
+Adafruit_Fingerprint finger = Adafruit_Fingerprint(&fpSerial);
+
+// ==================== CONSTANTS ====================
+const unsigned long WIFI_CHECK_INTERVAL   = 30000;
+const unsigned long SCAN_COOLDOWN         = 3000;
+const unsigned long CLOCK_UPDATE_INTERVAL = 1000;
+const unsigned long ALERT_DISPLAY_MS      = 3000;
+const unsigned long ENROLL_POLL_INTERVAL  = 3000;
+const unsigned long STATUS_PRINT_INTERVAL = 10000;
+const unsigned long VERSION_CHECK_INTERVAL = 30000;  // Check for new templates every 30 sec
+const int MAX_QUEUE_SIZE    = 10;
+const int MAX_STORED_EVENTS = 20;
+
+// ==================== ENUMS / STRUCTS ====================
+enum IdentityType { ID_NONE, ID_RFID, ID_FINGERPRINT };
+
+struct IdentityEvent {
+  IdentityType  type;
+  String        raw_id;
+  unsigned long timestamp_ms;
+  time_t        timestamp_utc;
+  bool          sent;
+  uint8_t       retryCount;
+};
+
+// ==================== STATE ====================
+IdentityEvent eventQueue[MAX_QUEUE_SIZE];
+int   queueHead = 0, queueTail = 0;
+bool  eventPending = false;
+
+unsigned long lastScanTime    = 0;
+unsigned long lastWiFiCheck   = 0;
+unsigned long lastClockUpdate = 0;
+unsigned long lastEnrollPoll  = 0;
+unsigned long lastStatusPrint = 0;
+unsigned long lastVersionCheck = 0;
+
+int localFingerprintVersion = 0;   // last synced DB version
+
+enum BuzzerPattern {
+  BUZZ_OFF,
+  BUZZ_SINGLE,
+  BUZZ_DOUBLE_PHASE1,
+  BUZZ_DOUBLE_PAUSE,
+  BUZZ_DOUBLE_PHASE2
+};
+BuzzerPattern buzzerPattern     = BUZZ_OFF;
+unsigned long buzzerPhaseStart  = 0;
+int           buzzerPhaseDuration = 0;
+
+bool          alertShowing = false;
+unsigned long alertShownAt = 0;
+
+// ── Fingerprint enroll state ──
+bool   enrollActive  = false;
+char   enrollJobId[32]   = "";
+char   enrollUserId[32]  = "";
+int    enrollSlot    = 0;
+char   enrollName[48]    = "";
+String enrollTemplateB64 = "";
+
+// ── RFID enroll state ──
+bool rfidEnrollActive    = false;
+char rfidEnrollJobId[32]  = "";
+char rfidEnrollUserId[32] = "";
+char rfidEnrollName[48]   = "";
+
+char lastTimeStr[12] = "";
+char lastDateStr[14] = "";
+char lastAmPm[4]     = "";
+bool idleScreenDrawn = false;
+
+int totalScans      = 0;
+int successfulScans = 0;
+int failedScans     = 0;
+int offlineSaved    = 0;
+
+// ==================== FORWARD DECLARATIONS ====================
+bool identifyUser(IdentityEvent& event, String& userId, String& userName,
+                  int& scanCount, String& greeting, int& httpCode);
+int  sendAttendance(String userId, time_t timestamp);
+void restoreFingerprintsFromDB();   // existing
+bool isFingerprintSyncNeeded();
+void syncFingerprintTemplates();
+
+// ==================== SERIAL DEBUG ====================
+void printSeparator()       { Serial.println("────────────────────────────────────────────────"); }
+void printDoubleSeparator() { Serial.println("════════════════════════════════════════════════"); }
+
+void printStatus() {
+  printDoubleSeparator();
+  Serial.println("  NISSI ATTENDRA — STATUS REPORT");
+  printDoubleSeparator();
+  time_t now = time(nullptr);
+  struct tm t; localtime_r(&now, &t);
+  char timeBuf[32];
+  strftime(timeBuf, sizeof(timeBuf), "%d/%m/%Y  %I:%M:%S %p", &t);
+  Serial.print("  Current Time   : "); Serial.println(timeBuf);
+  Serial.print("  WiFi Status    : ");
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("Connected  |  IP: "); Serial.print(WiFi.localIP().toString());
+    Serial.print("  |  RSSI: "); Serial.print(WiFi.RSSI()); Serial.println(" dBm");
+  } else { Serial.println("DISCONNECTED"); }
+  Serial.print("  Server URL     : "); Serial.println(serverUrl);
+  Serial.print("  Device ID      : "); Serial.println(deviceID);
+  printSeparator();
+  Serial.print("  Total Scans    : "); Serial.println(totalScans);
+  Serial.print("  Successful     : "); Serial.println(successfulScans);
+  Serial.print("  Failed/Unknown : "); Serial.println(failedScans);
+  Serial.print("  Offline Saved  : "); Serial.println(offlineSaved);
+  int qSize = (queueTail - queueHead + MAX_QUEUE_SIZE) % MAX_QUEUE_SIZE;
+  Serial.print("  Queue Pending  : "); Serial.println(qSize);
+  printSeparator();
+  Serial.print("  RFID Sensor    : ");
+  byte ver = rfid.PCD_ReadRegister(rfid.VersionReg);
+  if (ver == 0 || ver == 0xFF) Serial.println("NOT DETECTED");
+  else { Serial.print("OK  (fw v"); Serial.print(ver, HEX); Serial.println(")"); }
+  Serial.print("  Fingerprint    : ");
+  Serial.println(finger.verifyPassword() ? "OK" : "NOT DETECTED");
+  preferences.begin("events", true);
+  int stored = preferences.getInt("count", 0);
+  preferences.end();
+  Serial.print("  Stored Offline : "); Serial.print(stored); Serial.println(" event(s)");
+  Serial.print("  FP Version     : "); Serial.println(localFingerprintVersion);
+  printSeparator();
+  Serial.print("  Free Heap      : "); Serial.print(esp_get_free_heap_size()); Serial.println(" bytes");
+  Serial.print("  Uptime         : ");
+  unsigned long ms = millis(), s = ms/1000, m = s/60, h = m/60;
+  Serial.print(h); Serial.print("h "); Serial.print(m%60); Serial.print("m ");
+  Serial.print(s%60); Serial.println("s");
+  Serial.print("  Current Mode   : ");
+  if      (enrollActive)     Serial.println("ENROLLING FINGERPRINT");
+  else if (rfidEnrollActive) Serial.println("ENROLLING RFID CARD");
+  else if (alertShowing)     Serial.println("SHOWING ALERT");
+  else                       Serial.println("IDLE — scanning");
+  printDoubleSeparator();
+  Serial.println();
+}
+
+// ==================== BUZZER (async) ====================
+void beepAsyncSingle(int ms) {
+  buzzerPattern       = BUZZ_SINGLE;
+  buzzerPhaseStart    = millis();
+  buzzerPhaseDuration = ms;
+  digitalWrite(BUZZER_PIN, HIGH);
+}
+
+void beepAsyncDouble(int ms1, int gap, int ms2) {
+  buzzerPattern       = BUZZ_DOUBLE_PHASE1;
+  buzzerPhaseStart    = millis();
+  buzzerPhaseDuration = ms1;
+  digitalWrite(BUZZER_PIN, HIGH);
+}
+
+void updateBuzzer() {
+  unsigned long now = millis();
+  switch (buzzerPattern) {
+    case BUZZ_SINGLE:
+      if (now - buzzerPhaseStart >= (unsigned long)buzzerPhaseDuration) {
+        digitalWrite(BUZZER_PIN, LOW);
+        buzzerPattern = BUZZ_OFF;
+      }
+      break;
+    case BUZZ_DOUBLE_PHASE1:
+      if (now - buzzerPhaseStart >= (unsigned long)buzzerPhaseDuration) {
+        digitalWrite(BUZZER_PIN, LOW);
+        buzzerPattern       = BUZZ_DOUBLE_PAUSE;
+        buzzerPhaseStart    = now;
+        buzzerPhaseDuration = BEEP_THANKYOU_GAP;
+      }
+      break;
+    case BUZZ_DOUBLE_PAUSE:
+      if (now - buzzerPhaseStart >= (unsigned long)buzzerPhaseDuration) {
+        digitalWrite(BUZZER_PIN, HIGH);
+        buzzerPattern       = BUZZ_DOUBLE_PHASE2;
+        buzzerPhaseStart    = now;
+        buzzerPhaseDuration = BEEP_THANKYOU_2;
+      }
+      break;
+    case BUZZ_DOUBLE_PHASE2:
+      if (now - buzzerPhaseStart >= (unsigned long)buzzerPhaseDuration) {
+        digitalWrite(BUZZER_PIN, LOW);
+        buzzerPattern = BUZZ_OFF;
+      }
+      break;
+    default: break;
+  }
+}
+
+// ==================== IDLE SCREEN ====================
+void drawIdleScreen() {
+  tft.fillScreen(CLR_MID_BG);
+  tft.fillRect(0, 0, SCREEN_W, TOP_BAR_H, CLR_TOP_BG);
+  tft.setTextColor(CLR_TOP_TXT, CLR_TOP_BG); tft.setTextSize(2);
+  const char* ttl = "NISSI ATTENDANCE SYSTEM";
+  tft.setCursor((SCREEN_W-(int)strlen(ttl)*12)/2, (TOP_BAR_H-16)/2);
+  tft.print(ttl);
+  tft.fillRect(0, SCREEN_H-BOT_BAR_H, SCREEN_W, BOT_BAR_H, CLR_BOT_BG);
+  tft.setTextColor(CLR_BOT_TXT, CLR_BOT_BG); tft.setTextSize(2);
+  const char* bot = "PLEASE SCAN CARD/FINGER";
+  tft.setCursor((SCREEN_W-(int)strlen(bot)*12)/2,
+                SCREEN_H-BOT_BAR_H+(BOT_BAR_H-16)/2);
+  tft.print(bot);
+  lastTimeStr[0] = '\0'; lastDateStr[0] = '\0'; lastAmPm[0] = '\0';
+  idleScreenDrawn = true;
+}
+
+// ==================== CLOCK ====================
+void updateClock() {
+  if (!idleScreenDrawn) drawIdleScreen();
+  time_t now = time(nullptr);
+  struct tm t; localtime_r(&now, &t);
+  char timeStr[10], dateStr[14], ampm[4];
+  int h12 = t.tm_hour % 12; if (h12 == 0) h12 = 12;
+  snprintf(timeStr, sizeof(timeStr), "%02d:%02d", h12, t.tm_min);
+  snprintf(ampm,    sizeof(ampm),    "%s", t.tm_hour < 12 ? "AM" : "PM");
+  snprintf(dateStr, sizeof(dateStr), "%02d/%02d/%04d",
+           t.tm_mday, t.tm_mon+1, t.tm_year+1900);
+  bool timeChg = strcmp(timeStr, lastTimeStr) || strcmp(ampm, lastAmPm);
+  bool dateChg = strcmp(dateStr, lastDateStr) != 0;
+  if (timeChg) {
+    int cy = MID_Y + 10;
+    tft.fillRect(0, cy, SCREEN_W, 80, CLR_MID_BG);
+    tft.setTextColor(CLR_CLOCK, CLR_MID_BG); tft.setTextSize(6);
+    int tw = (int)strlen(timeStr)*36, tx = (SCREEN_W - tw - 50)/2;
+    tft.setCursor(tx, cy+6); tft.print(timeStr);
+    tft.setTextSize(3); tft.setCursor(tx+tw+6, cy+38); tft.print(ampm);
+    strncpy(lastTimeStr, timeStr, sizeof(lastTimeStr));
+    lastTimeStr[sizeof(lastTimeStr)-1] = '\0';
+    strncpy(lastAmPm, ampm, sizeof(lastAmPm));
+    lastAmPm[sizeof(lastAmPm)-1] = '\0';
+  }
+  if (dateChg) {
+    int pw=160, ph=28, px=(SCREEN_W-pw)/2, py=MID_Y+104;
+    tft.fillRect(px-4, py-4, pw+8, ph+8, CLR_MID_BG);
+    tft.fillRoundRect(px, py, pw, ph, 8, CLR_DATE_BG);
+    tft.setTextColor(TFT_WHITE, CLR_DATE_BG); tft.setTextSize(2);
+    int dw = (int)strlen(dateStr)*12;
+    tft.setCursor(px+(pw-dw)/2, py+(ph-16)/2); tft.print(dateStr);
+    strncpy(lastDateStr, dateStr, sizeof(lastDateStr));
+    lastDateStr[sizeof(lastDateStr)-1] = '\0';
+  }
+}
+
+// ==================== GENERIC ALERT ====================
+void showAlert(const char* line1, const char* line2, bool success) {
+  uint16_t bg = success ? 0x0720 : 0xA000;
+  tft.fillRect(0, MID_Y, SCREEN_W, MID_H, bg);
+  tft.setTextColor(TFT_WHITE, bg); tft.setTextSize(2);
+  int w1 = (int)strlen(line1)*12;
+  tft.setCursor((SCREEN_W-w1)/2, MID_Y+30); tft.print(line1);
+  if (line2 && strlen(line2) > 0) {
+    char disp[16]; strncpy(disp, line2, 15); disp[15] = '\0';
+    tft.setTextSize(3);
+    int w2 = (int)strlen(disp)*18;
+    tft.setCursor((SCREEN_W-w2)/2, MID_Y+65); tft.print(disp);
+  }
+  tft.setTextSize(5);
+  tft.setTextColor(success ? TFT_GREEN : TFT_RED, bg);
+  tft.setCursor(SCREEN_W/2-15, MID_Y+108);
+  tft.print(success ? "OK" : "XX");
+  alertShowing = true; alertShownAt = millis(); idleScreenDrawn = false;
+}
+
+// ==================== GREETING OVERLAY ====================
+void showGreeting(const char* greetLine, const char* name,
+                  bool isWelcome, int scanCount) {
+  uint16_t bg     = isWelcome ? CLR_WELCOME_BG  : CLR_THANKYOU_BG;
+  uint16_t accent = isWelcome ? CLR_WELCOME_ACC : CLR_THANKYOU_ACC;
+  tft.fillRect(0, MID_Y, SCREEN_W, MID_H, bg);
+  tft.setTextColor(accent, bg); tft.setTextSize(3);
+  int w1 = (int)strlen(greetLine)*18;
+  tft.setCursor((SCREEN_W-w1)/2, MID_Y+14); tft.print(greetLine);
+  char dispName[15]; strncpy(dispName, name, 14); dispName[14] = '\0';
+  tft.setTextColor(TFT_WHITE, bg); tft.setTextSize(3);
+  int w2 = (int)strlen(dispName)*18;
+  tft.setCursor((SCREEN_W-w2)/2, MID_Y+58); tft.print(dispName);
+  char scanLabel[22];
+  snprintf(scanLabel, sizeof(scanLabel), "%s  #%d",
+           isWelcome ? "Check-In" : "Check-Out", scanCount);
+  tft.setTextColor(accent, bg); tft.setTextSize(2);
+  int w3 = (int)strlen(scanLabel)*12;
+  tft.setCursor((SCREEN_W-w3)/2, MID_Y+104); tft.print(scanLabel);
+  tft.setTextColor(accent, bg); tft.setTextSize(4);
+  const char* icon = isWelcome ? ":)" : "OK";
+  int wi = (int)strlen(icon)*24;
+  tft.setCursor((SCREEN_W-wi)/2, MID_Y+128); tft.print(icon);
+  alertShowing = true; alertShownAt = millis(); idleScreenDrawn = false;
+}
+
+// ==================== ENROLMENT OVERLAY (Fingerprint) ====================
+void showEnrollScreen(const char* msg, int step) {
+  tft.fillRect(0, MID_Y, SCREEN_W, MID_H, 0x000F);
+  tft.setTextColor(TFT_CYAN, 0x000F); tft.setTextSize(2);
+  const char* hdr = "ENROLL MODE";
+  tft.setCursor((SCREEN_W-(int)strlen(hdr)*12)/2, MID_Y+14); tft.print(hdr);
+  tft.setTextColor(TFT_WHITE, 0x000F);
+  char nm[16]; strncpy(nm, enrollName, 15); nm[15] = '\0';
+  tft.setCursor((SCREEN_W-(int)strlen(nm)*12)/2, MID_Y+38); tft.print(nm);
+  tft.setTextColor(TFT_YELLOW, 0x000F);
+  tft.setCursor((SCREEN_W-(int)strlen(msg)*12)/2, MID_Y+76); tft.print(msg);
+  tft.setTextColor(TFT_GREEN, 0x000F); tft.setTextSize(4);
+  const char* sv = (step < 2) ? "1/2" : "2/2";
+  tft.setCursor(SCREEN_W/2-24, MID_Y+110); tft.print(sv);
+}
+
+// ==================== RFID ENROL OVERLAY ====================
+void showRfidEnrollScreen(const char* msg) {
+  tft.fillRect(0, MID_Y, SCREEN_W, MID_H, 0x3000);
+  tft.setTextColor(TFT_ORANGE, 0x3000); tft.setTextSize(2);
+  const char* hdr = "RFID ENROLL MODE";
+  tft.setCursor((SCREEN_W-(int)strlen(hdr)*12)/2, MID_Y+14); tft.print(hdr);
+  tft.setTextColor(TFT_WHITE, 0x3000);
+  char nm[16]; strncpy(nm, rfidEnrollName, 15); nm[15] = '\0';
+  tft.setCursor((SCREEN_W-(int)strlen(nm)*12)/2, MID_Y+38); tft.print(nm);
+  tft.setTextColor(TFT_YELLOW, 0x3000); tft.setTextSize(2);
+  tft.setCursor((SCREEN_W-(int)strlen(msg)*12)/2, MID_Y+76); tft.print(msg);
+  tft.setTextColor(TFT_ORANGE, 0x3000); tft.setTextSize(4);
+  const char* icon = "[CARD]";
+  int wi = (int)strlen(icon)*24;
+  tft.setCursor((SCREEN_W-wi)/2, MID_Y+110); tft.print(icon);
+}
+
+// ==================== EVENT QUEUE ====================
+bool enqueueEvent(IdentityEvent e) {
+  int next = (queueTail+1) % MAX_QUEUE_SIZE;
+  if (next == queueHead) {
+    Serial.println("[Queue] FULL — event dropped!"); return false;
+  }
+  eventQueue[queueTail] = e; queueTail = next; eventPending = true;
+  return true;
+}
+
+IdentityEvent dequeueEvent() {
+  IdentityEvent e = { ID_NONE, "", 0, 0, false, 0 };
+  if (queueHead != queueTail) {
+    e = eventQueue[queueHead];
+    queueHead = (queueHead+1) % MAX_QUEUE_SIZE;
+  }
+  if (queueHead == queueTail) eventPending = false;
+  return e;
+}
+
+// ==================== SCAN HELPERS ====================
+String getRFID() {
+  if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) return "";
+  String uid = "";
+  for (byte i = 0; i < rfid.uid.size; i++) {
+    if (rfid.uid.uidByte[i] < 0x10) uid += "0";
+    uid += String(rfid.uid.uidByte[i], HEX);
+  }
+  uid.toUpperCase();
+  rfid.PICC_HaltA(); rfid.PCD_StopCrypto1();
+  Serial.println("[RFID] Card detected  UID: " + uid);
+  return uid;
+}
+
+// ==================== FINGERPRINT MATCHING (LOCAL, OFFLINE) ====================
+String getFingerprintID() {
+  uint8_t p = finger.getImage();
+  if (p != FINGERPRINT_OK) {
+    if (p == FINGERPRINT_NOFINGER) return "";
+    Serial.println("[FP] Image error: " + String(p));
+    showAlert("Fingerprint Error", "Try again", false);
+    beepAsyncSingle(BEEP_ERROR);
+    return "";
+  }
+  Serial.println("[FP] Image captured");
+  p = finger.image2Tz();
+  if (p != FINGERPRINT_OK) {
+    Serial.println("[FP] image2Tz failed  code: " + String(p));
+    showAlert("Bad fingerprint", "Try again", false);
+    beepAsyncSingle(BEEP_ERROR);
+    return "";
+  }
+  p = finger.fingerSearch();
+  if (p != FINGERPRINT_OK) {
+    Serial.println("[FP] No match  code: " + String(p));
+    showAlert("Not registered", "Access Denied", false);
+    beepAsyncSingle(BEEP_ERROR);
+    return "";
+  }
+  Serial.println("[FP] Match!  ID: " + String(finger.fingerID) +
+                 "  confidence: " + String(finger.confidence));
+  return String(finger.fingerID);
+}
+
+// ==================== BASE64 (same as before) ====================
+static const char b64chars[] =
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+String base64Encode(uint8_t* data, size_t len) {
+  String result = "";
+  result.reserve(((len + 2) / 3) * 4 + 1);
+  for (size_t i = 0; i < len; i += 3) {
+    uint8_t b0 =  data[i];
+    uint8_t b1 = (i+1 < len) ? data[i+1] : 0;
+    uint8_t b2 = (i+2 < len) ? data[i+2] : 0;
+    result += b64chars[(b0 >> 2) & 0x3F];
+    result += b64chars[((b0 & 0x03) << 4) | ((b1 >> 4) & 0x0F)];
+    result += (i+1 < len) ? b64chars[((b1 & 0x0F) << 2) | ((b2 >> 6) & 0x03)] : '=';
+    result += (i+2 < len) ? b64chars[b2 & 0x3F] : '=';
+  }
+  return result;
+}
+
+int base64Decode(const String& src, uint8_t* dst, int dstLen) {
+  static const int8_t lookup[256] = {
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
+    52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
+    -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+    15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+    -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+    41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
+  };
+  int out = 0, srcLen = src.length();
+  for (int i = 0; i+3 < srcLen && out < dstLen; i += 4) {
+    int8_t a = lookup[(uint8_t)src[i]];
+    int8_t b = lookup[(uint8_t)src[i+1]];
+    int8_t c = lookup[(uint8_t)src[i+2]];
+    int8_t d = lookup[(uint8_t)src[i+3]];
+    if (a < 0 || b < 0) break;
+    if (out < dstLen) dst[out++] = (uint8_t)((a << 2) | (b >> 4));
+    if (c >= 0 && out < dstLen) dst[out++] = (uint8_t)((b << 4) | (c >> 2));
+    if (d >= 0 && out < dstLen) dst[out++] = (uint8_t)((c << 6) | d);
+  }
+  return out;
+}
+
+// ==================== FINGERPRINT ENROLMENT (unchanged) ====================
+bool doEnroll(int slot) {
+  printSeparator();
+  Serial.printf("[Enroll] Starting  slot=%d  name=%s\n", slot, enrollName);
+  printSeparator();
+  showEnrollScreen("Place finger (1/2)", 1);
+  unsigned long t0 = millis(); uint8_t p = FINGERPRINT_NOFINGER;
+  while (p != FINGERPRINT_OK && millis()-t0 < 20000) { p = finger.getImage(); delay(80); }
+  if (p != FINGERPRINT_OK) { Serial.println("[Enroll] TIMEOUT image 1"); return false; }
+  p = finger.image2Tz(1);
+  if (p != FINGERPRINT_OK) { Serial.println("[Enroll] image2Tz(1) FAILED  code: " + String(p)); return false; }
+  Serial.println("[Enroll] Image 1 OK");
+  showEnrollScreen("Remove finger", 1);
+  t0 = millis();
+  while (finger.getImage() != FINGERPRINT_NOFINGER && millis()-t0 < 8000) delay(100);
+  Serial.println("[Enroll] Finger removed"); delay(400);
+  showEnrollScreen("Place finger (2/2)", 2);
+  t0 = millis(); p = FINGERPRINT_NOFINGER;
+  while (p != FINGERPRINT_OK && millis()-t0 < 20000) { p = finger.getImage(); delay(80); }
+  if (p != FINGERPRINT_OK) { Serial.println("[Enroll] TIMEOUT image 2"); return false; }
+  p = finger.image2Tz(2);
+  if (p != FINGERPRINT_OK) { Serial.println("[Enroll] image2Tz(2) FAILED  code: " + String(p)); return false; }
+  Serial.println("[Enroll] Image 2 OK");
+  p = finger.createModel();
+  if (p != FINGERPRINT_OK) { Serial.println("[Enroll] createModel FAILED  code: " + String(p)); return false; }
+  p = finger.storeModel(slot);
+  if (p != FINGERPRINT_OK) { Serial.printf("[Enroll] storeModel(%d) FAILED  code: %d\n", slot, p); return false; }
+  Serial.printf("[Enroll] SUCCESS — stored at slot %d\n", slot);
+  enrollTemplateB64 = "";
+  return true;
+}
+
+void extractTemplateAfterEnroll(int slot) {
+  Serial.println("[Template] Extracting slot " + String(slot) + "...");
+  delay(500);
+  while (fpSerial.available()) fpSerial.read();
+  delay(100);
+  uint8_t p = finger.loadModel(slot);
+  if (p != FINGERPRINT_OK) {
+    Serial.println("[Template] loadModel FAILED code=" + String(p));
+    while (fpSerial.available()) fpSerial.read();
+    finger.begin(57600); delay(100);
+    while (fpSerial.available()) fpSerial.read();
+    return;
+  }
+  delay(200);
+  while (fpSerial.available()) fpSerial.read();
+  p = finger.getModel();
+  if (p != FINGERPRINT_OK) {
+    Serial.println("[Template] getModel FAILED code=" + String(p));
+    while (fpSerial.available()) fpSerial.read();
+    finger.begin(57600); delay(100);
+    while (fpSerial.available()) fpSerial.read();
+    return;
+  }
+  uint8_t templateData[512];
+  memset(templateData, 0, sizeof(templateData));
+  int bytesRead = 0;
+  unsigned long t0 = millis();
+  while (bytesRead < 512 && millis() - t0 < 5000) {
+    if (fpSerial.available()) templateData[bytesRead++] = (uint8_t)fpSerial.read();
+    else delay(1);
+  }
+  Serial.printf("[Template] Bytes read: %d\n", bytesRead);
+  if (bytesRead >= 500) {
+    enrollTemplateB64 = base64Encode(templateData, bytesRead);
+    Serial.printf("[Template] Encoded OK — %d chars\n", enrollTemplateB64.length());
+  } else {
+    Serial.println("[Template] Not enough bytes — skipping DB backup");
+    enrollTemplateB64 = "";
+  }
+  delay(200);
+  while (fpSerial.available()) fpSerial.read();
+  finger.begin(57600);
+  delay(200);
+  while (fpSerial.available()) fpSerial.read();
+  Serial.println("[Template] Sensor reinitialized — ready for scanning");
+}
+
+void reportEnrollResult(bool ok) {
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  http.begin(String(serverUrl) + "/api/enroll_fingerprint.php");
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(15000);
+  String payload = "{";
+  payload += "\"jobId\":\"";  payload += enrollJobId;  payload += "\",";
+  payload += "\"userId\":\""; payload += enrollUserId; payload += "\",";
+  payload += "\"slot\":";     payload += enrollSlot;   payload += ",";
+  payload += "\"status\":\""; payload += (ok ? "done" : "failed"); payload += "\"";
+  payload += "}";
+  int code = http.PUT(payload);
+  Serial.printf("[Enroll] Report HTTP %d\n", code);
+  if (code > 0) Serial.println(http.getString());
+  http.end();
+}
+
+void sendTemplateToServer() {
+  if (enrollTemplateB64.length() == 0) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+  Serial.printf("[Template] Sending (%d chars)...\n", enrollTemplateB64.length());
+  HTTPClient http;
+  http.begin(String(serverUrl) + "/api/enroll_fingerprint.php");
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(15000);
+  String payload = "{";
+  payload += "\"jobId\":\"";  payload += enrollJobId;  payload += "\",";
+  payload += "\"userId\":\""; payload += enrollUserId; payload += "\",";
+  payload += "\"slot\":";     payload += enrollSlot;   payload += ",";
+  payload += "\"status\":\"done\",";
+  payload += "\"template\":\""; payload += enrollTemplateB64; payload += "\"}";
+  int code = http.PUT(payload);
+  Serial.printf("[Template] Server HTTP %d\n", code);
+  if (code > 0) Serial.println(http.getString());
+  http.end();
+  enrollTemplateB64 = "";
+}
+
+// ==================== RFID ENROLMENT (unchanged) ====================
+bool doRfidEnroll(String& capturedUid) {
+  printSeparator();
+  Serial.printf("[RfidEnroll] Starting  name=%s\n", rfidEnrollName);
+  printSeparator();
+  rfid.PCD_Init(); delay(50);
+  showRfidEnrollScreen("Tap card on reader");
+  unsigned long t0 = millis();
+  while (millis() - t0 < 45000) {
+    rfid.PCD_Init(); delay(20);
+    if (!rfid.PICC_IsNewCardPresent()) { delay(80); continue; }
+    if (!rfid.PICC_ReadCardSerial())   { delay(80); continue; }
+    String uid = "";
+    for (byte i = 0; i < rfid.uid.size; i++) {
+      if (rfid.uid.uidByte[i] < 0x10) uid += "0";
+      uid += String(rfid.uid.uidByte[i], HEX);
+    }
+    uid.toUpperCase();
+    rfid.PICC_HaltA(); rfid.PCD_StopCrypto1();
+    capturedUid = uid;
+    Serial.println("[RfidEnroll] Card tapped  UID: " + uid);
+    rfid.PCD_Init();
+    return true;
+  }
+  rfid.PCD_Init();
+  Serial.println("[RfidEnroll] TIMEOUT — no card tapped");
+  return false;
+}
+
+void reportRfidEnrollResult(bool ok, const String& rfidId) {
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  http.begin(String(serverUrl) + "/api/enroll_rfid.php");
+  http.addHeader("Content-Type", "application/json");
+  StaticJsonDocument<192> doc;
+  doc["jobId"]  = rfidEnrollJobId;
+  doc["userId"] = rfidEnrollUserId;
+  doc["rfidId"] = rfidId;
+  doc["status"] = ok ? "done" : "failed";
+  String payload; serializeJson(doc, payload);
+  int code = http.PUT(payload);
+  Serial.printf("[RfidEnroll] Report HTTP %d\n", code);
+  if (code > 0) Serial.println(http.getString());
+  http.end();
+}
+
+// ==================== CHECK ENROLMENT QUEUES (unchanged) ====================
+void checkEnrollQueue() {
+  if (enrollActive || rfidEnrollActive || WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  http.begin(String(serverUrl) + "/api/enroll_fingerprint.php");
+  int code = http.GET();
+  if (code != 200) { http.end(); return; }
+  String body = http.getString(); http.end();
+  StaticJsonDocument<256> doc;
+  if (deserializeJson(doc, body)) return;
+  if (!doc["job"].as<bool>()) return;
+  strncpy(enrollJobId,  doc["jobId"].as<const char*>(),  sizeof(enrollJobId)-1);
+  enrollJobId[sizeof(enrollJobId)-1] = '\0';
+  strncpy(enrollUserId, doc["userId"].as<const char*>(), sizeof(enrollUserId)-1);
+  enrollUserId[sizeof(enrollUserId)-1] = '\0';
+  enrollSlot = doc["slot"] | 0;
+  strncpy(enrollName, doc["name"].as<const char*>(), sizeof(enrollName)-1);
+  enrollName[sizeof(enrollName)-1] = '\0';
+  printSeparator();
+  Serial.printf("[EnrollPoll] FP JOB: jobId=%s  slot=%d  name=%s\n",
+                enrollJobId, enrollSlot, enrollName);
+  printSeparator();
+  enrollActive = true;
+  beepAsyncSingle(BEEP_SCAN);
+  while (fpSerial.available()) fpSerial.read();
+  delay(100);
+  bool ok = doEnroll(enrollSlot);
+  if (ok) {
+    showAlert("Enrolled!", enrollName, true);
+    beepAsyncSingle(BEEP_ENROLL_OK);
+    reportEnrollResult(true);
+    extractTemplateAfterEnroll(enrollSlot);
+    sendTemplateToServer();
+    delay(200);
+    while (fpSerial.available()) fpSerial.read();
+    Serial.println("[Enroll] All done — scanner ready");
+  } else {
+    reportEnrollResult(false);
+    showAlert("Enrol Fail", enrollName, false);
+    beepAsyncSingle(BEEP_ERROR);
+    while (fpSerial.available()) fpSerial.read();
+    finger.begin(57600); delay(100);
+    while (fpSerial.available()) fpSerial.read();
+  }
+  enrollActive = false;
+}
+
+void checkRfidEnrollQueue() {
+  if (enrollActive || rfidEnrollActive || WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  http.begin(String(serverUrl) + "/api/enroll_rfid.php");
+  int code = http.GET();
+  if (code != 200) { http.end(); return; }
+  String body = http.getString(); http.end();
+  StaticJsonDocument<256> doc;
+  if (deserializeJson(doc, body)) return;
+  if (!doc["job"].as<bool>()) return;
+  strncpy(rfidEnrollJobId,  doc["jobId"].as<const char*>(),  sizeof(rfidEnrollJobId)-1);
+  rfidEnrollJobId[sizeof(rfidEnrollJobId)-1] = '\0';
+  strncpy(rfidEnrollUserId, doc["userId"].as<const char*>(), sizeof(rfidEnrollUserId)-1);
+  rfidEnrollUserId[sizeof(rfidEnrollUserId)-1] = '\0';
+  strncpy(rfidEnrollName,   doc["name"].as<const char*>(),   sizeof(rfidEnrollName)-1);
+  rfidEnrollName[sizeof(rfidEnrollName)-1] = '\0';
+  printSeparator();
+  Serial.printf("[RfidEnrollPoll] RFID JOB: jobId=%s  name=%s\n",
+                rfidEnrollJobId, rfidEnrollName);
+  printSeparator();
+  rfidEnrollActive = true;
+  beepAsyncSingle(BEEP_SCAN);
+  String capturedUid = "";
+  bool ok = doRfidEnroll(capturedUid);
+  reportRfidEnrollResult(ok, capturedUid);
+  rfidEnrollActive = false;
+  if (ok) {
+    char msg[32]; snprintf(msg, sizeof(msg), "UID: %.12s", capturedUid.c_str());
+    showAlert("RFID Saved!", msg, true);
+    beepAsyncSingle(BEEP_ENROLL_OK);
+  } else {
+    showAlert("RFID Fail", rfidEnrollName, false);
+    beepAsyncSingle(BEEP_ERROR);
+  }
+}
+
+// ==================== RESTORE FINGERPRINTS FROM DB (with version) ====================
+void restoreFingerprintsFromDB() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[Restore] WiFi not connected — aborting"); return;
+  }
+  Serial.println("[Restore] Fetching templates from DB...");
+  showAlert("Syncing...", "Please wait", true);
+  HTTPClient http;
+  http.begin(String(serverUrl) + "/api/enroll_fingerprint.php?restore=1");
+  http.setTimeout(20000);
+  int code = http.GET();
+  if (code != 200) {
+    Serial.printf("[Restore] Server error HTTP %d\n", code); http.end();
+    showAlert("Sync Fail", "Server error", false);
+    beepAsyncSingle(BEEP_ERROR); return;
+  }
+  String body = http.getString(); http.end();
+  DynamicJsonDocument doc(65536);
+  DeserializationError err = deserializeJson(doc, body);
+  if (err) {
+    Serial.println("[Restore] JSON parse failed: " + String(err.c_str()));
+    showAlert("Sync Fail", "Parse error", false);
+    beepAsyncSingle(BEEP_ERROR); return;
+  }
+  if (!doc["restore"].as<bool>()) {
+    Serial.println("[Restore] No templates in DB");
+    showAlert("Sync", "No templates", false);
+    beepAsyncSingle(BEEP_ERROR); return;
+  }
+  int total = doc["count"] | 0, success = 0, failed = 0;
+  int newVersion = doc["version"] | 0;
+  Serial.printf("[Restore] Found %d template(s), DB version %d\n", total, newVersion);
+  JsonArray templates = doc["templates"].as<JsonArray>();
+  for (JsonObject t : templates) {
+    int    slot        = t["slot"] | 0;
+    String name        = t["name"].as<String>();
+    String templateB64 = t["template"].as<String>();
+    Serial.printf("[Restore] slot=%d  name=%s\n", slot, name.c_str());
+    if (slot <= 0 || slot > 162) { failed++; continue; }
+    if (templateB64.length() == 0) { failed++; continue; }
+    uint8_t templateData[512];
+    memset(templateData, 0, sizeof(templateData));
+    int decoded = base64Decode(templateB64, templateData, 512);
+    if (decoded != 512) {
+      Serial.printf("[Restore] Bad decode: %d bytes\n", decoded);
+      failed++; continue;
+    }
+    // Write template to sensor (custom packet method)
+    uint8_t downCharCmd[] = {0xEF,0x01, 0xFF,0xFF,0xFF,0xFF, 0x01, 0x00,0x04, 0x09, 0x01, 0x00,0x0F};
+    fpSerial.write(downCharCmd, sizeof(downCharCmd));
+    delay(100);
+    while (fpSerial.available()) fpSerial.read();
+    int sent = 0;
+    while (sent < 512) {
+      int chunkSize   = min(128, 512 - sent);
+      bool isLast     = (sent + chunkSize >= 512);
+      uint8_t pid     = isLast ? 0x08 : 0x02;
+      uint16_t pktLen = chunkSize + 2;
+      uint8_t hdr[]   = {0xEF,0x01, 0xFF,0xFF,0xFF,0xFF, pid, (uint8_t)(pktLen >> 8), (uint8_t)(pktLen & 0xFF)};
+      fpSerial.write(hdr, sizeof(hdr));
+      fpSerial.write(templateData + sent, chunkSize);
+      uint16_t chk = pid + (pktLen >> 8) + (pktLen & 0xFF);
+      for (int k = 0; k < chunkSize; k++) chk += templateData[sent + k];
+      fpSerial.write((uint8_t)(chk >> 8));
+      fpSerial.write((uint8_t)(chk & 0xFF));
+      sent += chunkSize; delay(20);
+    }
+    delay(200);
+    while (fpSerial.available()) fpSerial.read();
+    uint8_t res = finger.storeModel(slot);
+    if (res == FINGERPRINT_OK) {
+      Serial.printf("[Restore] Slot %d OK — %s\n", slot, name.c_str());
+      success++;
+    } else {
+      Serial.printf("[Restore] Slot %d FAIL code=%d\n", slot, res);
+      failed++;
+    }
+    delay(200);
+  }
+  Serial.printf("[Restore] Done: %d ok, %d failed\n", success, failed);
+  if (success > 0 && failed == 0) {
+    char msg[20]; snprintf(msg, sizeof(msg), "%d restored", success);
+    showAlert("Sync Done!", msg, true); beepAsyncSingle(BEEP_ENROLL_OK);
+    // Save the new version locally
+    localFingerprintVersion = newVersion;
+    preferences.begin("fp", false);
+    preferences.putInt("version", localFingerprintVersion);
+    preferences.end();
+  } else if (success > 0) {
+    char msg[20]; snprintf(msg, sizeof(msg), "%d ok %d fail", success, failed);
+    showAlert("Partial Sync", msg, true); beepAsyncSingle(BEEP_SCAN);
+  } else {
+    showAlert("Sync Fail", "0 restored", false); beepAsyncSingle(BEEP_ERROR);
+  }
+}
+
+// ==================== VERSION CHECK & SYNC TRIGGER ====================
+bool isFingerprintSyncNeeded() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  HTTPClient http;
+  http.begin(String(serverUrl) + "/api/fingerprint_version.php");
+  http.addHeader("Content-Type", "application/json");
+  StaticJsonDocument<64> doc;
+  doc["deviceId"] = deviceID;
+  doc["currentVersion"] = localFingerprintVersion;
+  String payload; serializeJson(doc, payload);
+  int code = http.POST(payload);
+  if (code == 200) {
+    String body = http.getString();
+    StaticJsonDocument<32> res;
+    deserializeJson(res, body);
+    bool needSync = res["needSync"] | false;
+    http.end();
+    return needSync;
+  }
+  http.end();
+  return false;
+}
+
+void syncFingerprintTemplates() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[Sync] WiFi not connected – skipping");
+    return;
+  }
+  if (enrollActive || rfidEnrollActive) {
+    Serial.println("[Sync] Enrollment active – skipping");
+    return;
+  }
+  Serial.println("[Sync] Checking for fingerprint DB updates...");
+  if (isFingerprintSyncNeeded()) {
+    Serial.println("[Sync] New templates available – syncing...");
+    restoreFingerprintsFromDB();
+    idleScreenDrawn = false;
+    drawIdleScreen();
+    updateClock();
+  } else {
+    Serial.println("[Sync] Already up to date (version " + String(localFingerprintVersion) + ")");
+  }
+}
+
+// ==================== OFFLINE STORAGE (unchanged) ====================
+void saveEventToPreferences(const IdentityEvent& e) {
+  preferences.begin("events", false);
+  int cnt = preferences.getInt("count", 0);
+  if (cnt < MAX_STORED_EVENTS) {
+    String key  = "ev" + String(cnt);
+    String data = String((int)e.type) + "|" + e.raw_id + "|" +
+                  String(e.timestamp_ms) + "|" + String((long)e.timestamp_utc) + "|" +
+                  String(e.retryCount);
+    preferences.putString(key.c_str(), data);
+    preferences.putInt("count", cnt+1);
+    offlineSaved++;
+    Serial.println("[Offline] Saved: " + data + "  total=" + String(cnt+1));
+  } else { Serial.println("[Offline] Storage FULL"); }
+  preferences.end();
+}
+
+void sendStoredEvents() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  preferences.begin("events", false);
+  int cnt = preferences.getInt("count", 0);
+  if (cnt == 0) { preferences.end(); return; }
+  Serial.println("[Offline] Syncing " + String(cnt) + " event(s)...");
+  for (int i = 0; i < cnt; ) {
+    String key  = "ev" + String(i);
+    String data = preferences.getString(key.c_str(), "");
+    if (data.length() == 0) { i++; continue; }
+    int s1 = data.indexOf('|');
+    int s2 = data.indexOf('|', s1+1);
+    int s3 = data.indexOf('|', s2+1);
+    int s4 = data.indexOf('|', s3+1);
+    if (s1<0||s2<0||s3<0||s4<0) {
+      for (int j=i;j<cnt-1;j++)
+        preferences.putString(("ev"+String(j)).c_str(),
+          preferences.getString(("ev"+String(j+1)).c_str(),""));
+      preferences.remove(("ev"+String(cnt-1)).c_str());
+      cnt--; preferences.putInt("count",cnt); continue;
+    }
+    IdentityEvent e;
+    e.type          = (IdentityType)data.substring(0,s1).toInt();
+    e.raw_id        = data.substring(s1+1,s2);
+    e.timestamp_ms  = data.substring(s2+1,s3).toInt();
+    e.timestamp_utc = (time_t)data.substring(s3+1,s4).toInt();
+    e.retryCount    = (uint8_t)data.substring(s4+1).toInt();
+    e.sent = false;
+    String userId,userName,greeting; int scanCount=1,httpCode;
+    bool identified = identifyUser(e,userId,userName,scanCount,greeting,httpCode);
+    if (identified) {
+      sendAttendance(userId,e.timestamp_utc>100000?e.timestamp_utc:(time_t)e.timestamp_ms);
+      for(int j=i;j<cnt-1;j++)
+        preferences.putString(("ev"+String(j)).c_str(),
+          preferences.getString(("ev"+String(j+1)).c_str(),""));
+      preferences.remove(("ev"+String(cnt-1)).c_str());
+      cnt--; preferences.putInt("count",cnt);
+      Serial.println("[Offline] Event sent and removed.");
+    } else {
+      if (httpCode==404) {
+        Serial.println("[Offline] Unknown ID, deleting.");
+        for(int j=i;j<cnt-1;j++)
+          preferences.putString(("ev"+String(j)).c_str(),
+            preferences.getString(("ev"+String(j+1)).c_str(),""));
+        preferences.remove(("ev"+String(cnt-1)).c_str());
+        cnt--; preferences.putInt("count",cnt);
+      } else {
+        e.retryCount++;
+        if (e.retryCount>=5) {
+          Serial.println("[Offline] Max retries, deleting.");
+          for(int j=i;j<cnt-1;j++)
+            preferences.putString(("ev"+String(j)).c_str(),
+              preferences.getString(("ev"+String(j+1)).c_str(),""));
+          preferences.remove(("ev"+String(cnt-1)).c_str());
+          cnt--; preferences.putInt("count",cnt);
+        } else {
+          String nd = String((int)e.type)+"|"+e.raw_id+"|"+
+                      String(e.timestamp_ms)+"|"+String((long)e.timestamp_utc)+"|"+
+                      String(e.retryCount);
+          preferences.putString(key.c_str(),nd); i++;
+        }
+      }
+    }
+  }
+  preferences.end();
+  Serial.println("[Offline] Sync complete");
+}
+
+// ==================== IDENTIFY USER (online, but fingerprint uses local ID) ====================
+bool identifyUser(IdentityEvent& event, String& userId, String& userName,
+                  int& scanCount, String& greeting, int& httpCode) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[Identify] WiFi not connected"); httpCode=-1; return false;
+  }
+  Serial.print("[Identify] type=");
+  Serial.print(event.type==ID_RFID?"RFID":"FINGERPRINT");
+  Serial.println("  rawId="+event.raw_id);
+  HTTPClient http;
+  http.begin(String(serverUrl)+"/api/identify.php");
+  http.addHeader("Content-Type","application/json");
+  StaticJsonDocument<200> doc;
+  doc["deviceId"]  = deviceID;
+  doc["type"]      = (event.type==ID_RFID)?"rfid":"fingerprint";
+  doc["rawId"]     = event.raw_id;
+  doc["timestamp"] = (event.timestamp_utc>100000)?event.timestamp_utc:event.timestamp_ms;
+  String payload; serializeJson(doc,payload);
+  Serial.println("[Identify] POST: "+payload);
+  int code = http.POST(payload);
+  String body = http.getString();
+  httpCode = code;
+  Serial.printf("[Identify] HTTP %d  body: %s\n",code,body.c_str());
+  if (code==200) {
+    StaticJsonDocument<256> res;
+    if (!deserializeJson(res,body) && res.containsKey("userId")) {
+      userId    = res["userId"].as<String>();
+      userName  = res["name"].as<String>();
+      scanCount = res["scanCount"]|1;
+      String g  = res["greeting"].as<String>();
+      greeting  = (g.length()>0)?g:((scanCount%2==1)?"Welcome":"Thank You");
+      Serial.println("[Identify] Found: "+userName+"  scan#"+String(scanCount)+
+                     "  greeting="+greeting);
+      http.end(); return true;
+    }
+  } else if (code==404) {
+    Serial.println("[Identify] Unknown identity");
+  } else {
+    Serial.println("[Identify] Server error HTTP "+String(code));
+  }
+  http.end(); return false;
+}
+
+// ==================== SEND ATTENDANCE ====================
+int sendAttendance(String userId, time_t timestamp) {
+  if (WiFi.status()!=WL_CONNECTED) {
+    Serial.println("[Attend] WiFi not connected"); return -1;
+  }
+  char tsBuf[32]; struct tm ts; localtime_r(&timestamp,&ts);
+  strftime(tsBuf,sizeof(tsBuf),"%d/%m/%Y %I:%M:%S %p",&ts);
+  Serial.println("[Attend] userId="+userId+"  time="+String(tsBuf));
+  HTTPClient http;
+  http.begin(String(serverUrl)+"/api/record_attendance.php");
+  http.addHeader("Content-Type","application/json");
+  StaticJsonDocument<200> doc;
+  doc["userId"]    = userId;
+  doc["timestamp"] = (long)timestamp;
+  doc["deviceId"]  = deviceID;
+  String payload; serializeJson(doc,payload);
+  int code = http.POST(payload);
+  String body = http.getString();
+  Serial.printf("[Attend] HTTP %d  body: %s\n",code,body.c_str());
+  int sc=1;
+  if (code==200) {
+    StaticJsonDocument<200> res;
+    if (!deserializeJson(res,body)&&res.containsKey("scanCount"))
+      sc=res["scanCount"].as<int>();
+  }
+  http.end(); return sc;
+}
+
+// ==================== DETAILED EVENT PRINT ====================
+void printEventDetails(const IdentityEvent& e, const String& userId, const String& userName,
+                       int scanCount, const String& greeting, bool identified,
+                       int httpCode, int attendResult) {
+  printDoubleSeparator();
+  Serial.println("  >>> ATTENDANCE EVENT DETAILS <<<");
+  printSeparator();
+  Serial.print("  Scan #            : "); Serial.println(totalScans);
+  Serial.print("  Event time (local): ");
+  time_t ts = (e.timestamp_utc > 100000) ? e.timestamp_utc : time(nullptr);
+  struct tm t; localtime_r(&ts, &t);
+  char buf[32]; strftime(buf, sizeof(buf), "%d/%m/%Y %I:%M:%S %p", &t);
+  Serial.println(buf);
+  Serial.print("  Identity type     : "); Serial.println(e.type == ID_RFID ? "RFID" : "FINGERPRINT");
+  Serial.print("  Raw ID            : "); Serial.println(e.raw_id);
+  Serial.print("  Identified        : "); Serial.println(identified ? "YES" : "NO");
+  if (identified) {
+    Serial.print("  User ID           : "); Serial.println(userId);
+    Serial.print("  Name              : "); Serial.println(userName);
+    Serial.print("  Scan count        : "); Serial.println(scanCount);
+    Serial.print("  Greeting          : "); Serial.println(greeting);
+    Serial.print("  Attendance send   : HTTP "); Serial.println(attendResult);
+  } else {
+    Serial.print("  HTTP code         : "); Serial.println(httpCode);
+    if (WiFi.status() != WL_CONNECTED)
+      Serial.println("  Offline save      : YES (WiFi lost)");
+    else if (httpCode != 404)
+      Serial.println("  Offline save      : YES (server error)");
+    else
+      Serial.println("  Offline save      : NO (unknown ID)");
+  }
+  printDoubleSeparator();
+  Serial.println();
+}
+
+// ==================== PROCESS EVENT ====================
+void processEvent(IdentityEvent e) {
+  totalScans++;
+  printSeparator();
+  Serial.println("[Event] Processing scan #" + String(totalScans));
+  showAlert("Identifying...", "Please wait", true);
+  String userId, userName, greeting = "Welcome";
+  int scanCount = 1, httpCode = 0;
+  bool identified = identifyUser(e, userId, userName, scanCount, greeting, httpCode);
+  int attendResult = -1;
+  if (identified) {
+    successfulScans++;
+    time_t ts = (e.timestamp_utc > 100000) ? e.timestamp_utc : time(nullptr);
+    bool isWelcome;
+    if      (greeting == "Welcome"  || greeting == "WELCOME")   isWelcome = true;
+    else if (greeting == "Thank You"|| greeting == "THANK YOU") isWelcome = false;
+    else                                                       isWelcome = (scanCount % 2 == 1);
+    const char* greetLine = isWelcome ? "Welcome!" : "Thank You!";
+    Serial.println("[Event] >>> " + (String)greetLine + " " + userName +
+                   "  scan#" + String(scanCount) +
+                   "  (" + (String)(isWelcome ? "CHECK-IN" : "CHECK-OUT") + ")");
+    showGreeting(greetLine, userName.c_str(), isWelcome, scanCount);
+    if (isWelcome) beepAsyncSingle(BEEP_WELCOME);
+    else beepAsyncDouble(BEEP_THANKYOU_1, BEEP_THANKYOU_GAP, BEEP_THANKYOU_2);
+    attendResult = sendAttendance(userId, ts);
+  } else {
+    failedScans++;
+    Serial.println("[Event] Access Denied — unknown ID");
+    showAlert("Access Denied", "Unknown ID", false);
+    beepAsyncSingle(BEEP_ERROR);
+    if (WiFi.status() != WL_CONNECTED) {
+      e.retryCount = 0;
+      saveEventToPreferences(e);
+      Serial.println("[Event] Event saved offline (WiFi lost)");
+    } else if (httpCode != 404) {
+      e.retryCount = 0;
+      saveEventToPreferences(e);
+      Serial.println("[Event] Event saved offline (server error " + String(httpCode) + ")");
+    } else {
+      Serial.println("[Event] Event not saved (unknown ID, server returned 404)");
+    }
+  }
+  printEventDetails(e, userId, userName, scanCount, greeting, identified, httpCode, attendResult);
+  printSeparator();
+}
+
+// ==================== SCANNER LOOP (fingerprint uses local matching) ====================
+void scannerLoop() {
+  if (enrollActive || rfidEnrollActive) return;
+  unsigned long now = millis();
+  // RFID
+  String rfidID = getRFID();
+  if (rfidID.length()>0 && now-lastScanTime>=SCAN_COOLDOWN) {
+    Serial.println("[Scanner] RAW RFID capture: " + rfidID);
+    IdentityEvent e = {ID_RFID, rfidID, now, time(nullptr), false, 0};
+    if (enqueueEvent(e)) {
+      lastScanTime=now; beepAsyncSingle(BEEP_SCAN);
+      Serial.println("[Scanner] RFID queued: " + rfidID);
+    }
+  }
+  // Fingerprint - LOCAL matching (offline capable)
+  String fpID = getFingerprintID();  // uses fingerSearch() - local sensor DB
+  if (fpID.length()>0 && now-lastScanTime>=SCAN_COOLDOWN) {
+    Serial.println("[Scanner] RAW fingerprint capture ID: " + fpID);
+    IdentityEvent e = {ID_FINGERPRINT, fpID, now, time(nullptr), false, 0};
+    if (enqueueEvent(e)) {
+      lastScanTime=now; beepAsyncSingle(BEEP_SCAN);
+      Serial.println("[Scanner] FP queued ID: " + fpID);
+    }
+  }
+}
+
+// ==================== WIFI ====================
+void connectWiFi() {
+  printSeparator();
+  Serial.println("[WiFi] Connecting: "+String(ssid));
+  tft.fillRect(0,MID_Y,SCREEN_W,MID_H,CLR_MID_BG);
+  tft.setTextColor(TFT_WHITE,CLR_MID_BG); tft.setTextSize(2);
+  tft.setCursor(20,MID_Y+30); tft.print("Connecting WiFi...");
+  tft.setCursor(20,MID_Y+55); tft.print(ssid);
+  WiFi.begin(ssid,password);
+  int att=0;
+  while (WiFi.status()!=WL_CONNECTED&&att<20){delay(500);att++;Serial.print(".");}
+  Serial.println();
+  tft.fillRect(0,MID_Y,SCREEN_W,MID_H,CLR_MID_BG);
+  if (WiFi.status()==WL_CONNECTED) {
+    Serial.println("[WiFi] Connected!  IP: "+WiFi.localIP().toString());
+    tft.setTextColor(TFT_GREEN,CLR_MID_BG);
+    tft.setCursor(20,MID_Y+30); tft.print("WiFi Connected!");
+    tft.setTextColor(TFT_WHITE,CLR_MID_BG);
+    tft.setCursor(20,MID_Y+55); tft.print(WiFi.localIP().toString());
+    syncTime(); sendStoredEvents();
+  } else {
+    Serial.println("[WiFi] FAILED — offline mode");
+    tft.setTextColor(TFT_RED,CLR_MID_BG);
+    tft.setCursor(20,MID_Y+40); tft.print("WiFi Failed (offline)");
+  }
+  printSeparator(); delay(800);
+}
+
+void syncTime() {
+  Serial.println("[NTP] Syncing...");
+  configTime(gmtOffset_sec,daylightOffset_sec,ntpServer);
+  time_t now=time(nullptr); int retry=0;
+  while (now<100000&&retry<20){delay(500);now=time(nullptr);retry++;}
+  if (retry<20) {
+    struct tm t; localtime_r(&now,&t);
+    char buf[32]; strftime(buf,sizeof(buf),"%d/%m/%Y %I:%M:%S %p",&t);
+    Serial.println("[NTP] Synced: "+String(buf));
+  } else { Serial.println("[NTP] Sync failed"); }
+}
+
+// ==================== DEVICE ID ====================
+String generateDeviceID() {
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  char buf[13];
+  sprintf(buf, "%02X%02X%02X%02X%02X%02X",
+          mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return String(buf);
+}
+
+void loadOrCreateDeviceID() {
+  preferences.begin("device",false);
+  if (preferences.isKey("id")) {
+    deviceID=preferences.getString("id");
+    Serial.println("[Device] Loaded ID: "+deviceID);
+  } else {
+    deviceID=generateDeviceID();
+    preferences.putString("id",deviceID);
+    Serial.println("[Device] Generated ID: "+deviceID);
+  }
+  preferences.end();
+}
+
+// ==================== SETUP ====================
+void setup() {
+  Serial.begin(115200); delay(300);
+  printDoubleSeparator();
+  Serial.println("  NISSI ATTENDRA — BOOTING");
+  Serial.println("  Firmware : A010-fp-template-backup-final");
+  Serial.println("  Compiled : " __DATE__ " " __TIME__);
+  printDoubleSeparator();
+
+  pinMode(BUZZER_PIN,OUTPUT); digitalWrite(BUZZER_PIN,LOW);
+  digitalWrite(BUZZER_PIN,HIGH); delay(BEEP_BOOT); digitalWrite(BUZZER_PIN,LOW);
+  Serial.println("[Boot] Buzzer OK");
+
+  tft.init(); tft.setRotation(2); tft.fillScreen(CLR_MID_BG);
+  Serial.println("[Boot] TFT OK");
+
+  tft.fillRect(0,0,SCREEN_W,TOP_BAR_H,CLR_TOP_BG);
+  tft.setTextColor(CLR_TOP_TXT,CLR_TOP_BG); tft.setTextSize(2);
+  const char* ttl="NISSI ATTENDANCE SYSTEM";
+  tft.setCursor((SCREEN_W-(int)strlen(ttl)*12)/2,(TOP_BAR_H-16)/2); tft.print(ttl);
+  tft.fillRect(0,SCREEN_H-BOT_BAR_H,SCREEN_W,BOT_BAR_H,CLR_BOT_BG);
+  tft.setTextColor(CLR_BOT_TXT,CLR_BOT_BG); tft.setTextSize(2);
+  const char* bt="Booting...";
+  tft.setCursor((SCREEN_W-(int)strlen(bt)*12)/2,
+                SCREEN_H-BOT_BAR_H+(BOT_BAR_H-16)/2); tft.print(bt);
+
+  loadOrCreateDeviceID();
+  connectWiFi();
+
+  Wire.begin(I2C_SDA,I2C_SCL); rfid.PCD_Init();
+  byte ver=rfid.PCD_ReadRegister(rfid.VersionReg);
+  if (ver==0||ver==0xFF) Serial.println("[RFID] NOT DETECTED");
+  else Serial.println("[RFID] OK  fw v"+String(ver,HEX));
+
+  fpSerial.begin(57600,SERIAL_8N1,FP_RX,FP_TX); finger.begin(57600);
+  Serial.println(finger.verifyPassword()?"[FP] OK":"[FP] NOT DETECTED");
+
+  // Load saved fingerprint DB version
+  preferences.begin("fp", true);
+  localFingerprintVersion = preferences.getInt("version", 0);
+  preferences.end();
+  Serial.println("[FP] Local DB version: " + String(localFingerprintVersion));
+
+  delay(300); idleScreenDrawn=false; drawIdleScreen(); updateClock();
+
+  tft.fillRect(0,SCREEN_H-BOT_BAR_H,SCREEN_W,BOT_BAR_H,CLR_BOT_BG);
+  tft.setTextColor(CLR_BOT_TXT,CLR_BOT_BG); tft.setTextSize(2);
+  const char* rd="PLEASE SCAN CARD/FINGER";
+  tft.setCursor((SCREEN_W-(int)strlen(rd)*12)/2,
+                SCREEN_H-BOT_BAR_H+(BOT_BAR_H-16)/2); tft.print(rd);
+
+  // Initial sync
+  syncFingerprintTemplates();
+
+  printDoubleSeparator();
+  Serial.println("  BOOT COMPLETE — System Ready");
+  Serial.println("  Commands: 'restore'  'status'");
+  printDoubleSeparator();
+  printStatus();
+}
+
+// ==================== LOOP ====================
+void loop() {
+  updateBuzzer();
+
+  if (Serial.available()) {
+    String cmd=Serial.readStringUntil('\n'); cmd.trim(); cmd.toLowerCase();
+    if      (cmd=="restore") { Serial.println("[CMD] Restoring..."); restoreFingerprintsFromDB(); }
+    else if (cmd=="status")  { printStatus(); }
+    else if (cmd.length()>0) {
+      Serial.println("[CMD] Unknown: "+cmd);
+      Serial.println("[CMD] Available: 'restore', 'status'");
+    }
+  }
+
+  if (alertShowing && millis()-alertShownAt>=ALERT_DISPLAY_MS) {
+    alertShowing=false; drawIdleScreen(); updateClock();
+  }
+
+  if (millis()-lastWiFiCheck>WIFI_CHECK_INTERVAL) {
+    lastWiFiCheck=millis();
+    if (WiFi.status()!=WL_CONNECTED) {
+      Serial.println("[WiFi] Lost — reconnecting...");
+      connectWiFi(); idleScreenDrawn=false;
+    }
+  }
+
+  if (!alertShowing&&!enrollActive&&!rfidEnrollActive&&
+      millis()-lastClockUpdate>=CLOCK_UPDATE_INTERVAL) {
+    lastClockUpdate=millis(); updateClock();
+  }
+
+  if (!enrollActive&&!rfidEnrollActive&&!alertShowing&&
+      WiFi.status()==WL_CONNECTED&&
+      millis()-lastEnrollPoll>=ENROLL_POLL_INTERVAL) {
+    lastEnrollPoll=millis();
+    checkEnrollQueue();
+    if (!enrollActive) checkRfidEnrollQueue();
+  }
+
+  // NEW: periodic lightweight version check and sync
+  if (!enrollActive && !rfidEnrollActive && !alertShowing &&
+      WiFi.status() == WL_CONNECTED &&
+      millis() - lastVersionCheck >= VERSION_CHECK_INTERVAL) {
+    lastVersionCheck = millis();
+    syncFingerprintTemplates();
+  }
+
+  if (millis()-lastStatusPrint>=STATUS_PRINT_INTERVAL) {
+    lastStatusPrint=millis(); printStatus();
+  }
+
+  scannerLoop();
+
+  if (eventPending&&!alertShowing&&!enrollActive&&!rfidEnrollActive) {
+    IdentityEvent e=dequeueEvent();
+    if (e.type!=ID_NONE) processEvent(e);
+  }
+
+  delay(10);
+}
